@@ -79,6 +79,34 @@ func createDelivery(
 	return del, nil
 }
 
+func createDeliveryRead(
+	ctx context.Context, config *tpcc, mcp *workload.MultiConnPool,
+) (tpccTx, error) {
+	del := &delivery{
+		config: config,
+		mcp:    mcp,
+	}
+
+	del.selectNewOrder = del.sr.Define(`
+		SELECT no_o_id
+		FROM new_order
+		WHERE no_w_id = $1 AND no_d_id = $2
+		ORDER BY no_o_id ASC
+		LIMIT 1`,
+	)
+
+	del.sumAmount = del.sr.Define(`
+		SELECT sum(ol_amount) FROM order_line
+		WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3`,
+	)
+
+	if err := del.sr.Init(ctx, "delivery-read", mcp); err != nil {
+		return nil, err
+	}
+
+	return del, nil
+}
+
 func (del *delivery) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&del.config.auditor.deliveryTransactions, 1)
 

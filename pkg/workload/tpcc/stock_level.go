@@ -90,6 +90,44 @@ func createStockLevel(
 	return s, nil
 }
 
+func createStockLevelRead(
+	ctx context.Context, config *tpcc, mcp *workload.MultiConnPool,
+) (tpccTx, error) {
+	s := &stockLevel{
+		config: config,
+		mcp:    mcp,
+	}
+
+	s.selectDNextOID = s.sr.Define(`
+		SELECT d_next_o_id
+		FROM district
+		WHERE d_w_id = $1 AND d_id = $2`,
+	)
+
+	// Count the number of recently sold items that have a stock level below
+	// the threshold.
+	// TODO(radu): we use count(DISTINCT s_i_id) because DISTINCT inside
+	// aggregates was not supported by the optimizer. This can be cleaned up.
+	s.countRecentlySold = s.sr.Define(`
+		SELECT count(*) FROM (
+			SELECT DISTINCT s_i_id
+			FROM order_line
+			JOIN stock
+			ON s_i_id=ol_i_id AND s_w_id=ol_w_id
+			WHERE ol_w_id = $1
+				AND ol_d_id = $2
+				AND ol_o_id BETWEEN $3 - 20 AND $3 - 1
+				AND s_quantity < $4
+		)`,
+	)
+
+	if err := s.sr.Init(ctx, "stock-level-read", mcp); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
 func (s *stockLevel) run(ctx context.Context, wID int) (interface{}, error) {
 	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 

@@ -116,6 +116,52 @@ func createOrderStatus(
 	return o, nil
 }
 
+func createOrderStatusRead(
+	ctx context.Context, config *tpcc, mcp *workload.MultiConnPool,
+) (tpccTx, error) {
+	o := &orderStatus{
+		config: config,
+		mcp:    mcp,
+	}
+
+	// Select by customer id.
+	o.selectByCustID = o.sr.Define(`
+		SELECT c_balance, c_first, c_middle, c_last
+		FROM customer
+		WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3`,
+	)
+
+	// Pick the middle row, rounded up, from the selection by last name.
+	o.selectByLastName = o.sr.Define(`
+		SELECT c_id, c_balance, c_first, c_middle
+		FROM customer
+		WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
+		ORDER BY c_first ASC`,
+	)
+
+	// Select the customer's order.
+	o.selectOrder = o.sr.Define(`
+		SELECT o_id, o_entry_d, o_carrier_id
+		FROM "order"
+		WHERE o_w_id = $1 AND o_d_id = $2 AND o_c_id = $3
+		ORDER BY o_id DESC
+		LIMIT 1`,
+	)
+
+	// Select the items from the customer's order.
+	o.selectItems = o.sr.Define(`
+		SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d
+		FROM order_line
+		WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3`,
+	)
+
+	if err := o.sr.Init(ctx, "order-status-read", mcp); err != nil {
+		return nil, err
+	}
+
+	return o, nil
+}
+
 func (o *orderStatus) run(ctx context.Context, wID int) (interface{}, error) {
 	atomic.AddUint64(&o.config.auditor.orderStatusTransactions, 1)
 

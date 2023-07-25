@@ -101,6 +101,9 @@ type tpcc struct {
 		values [][]int
 	}
 	localsPool *sync.Pool
+
+	// workloadType determines the workload is a read-only, write-only or mixed.
+	workloadType string
 }
 
 type waitSetter struct {
@@ -182,6 +185,7 @@ var tpccMeta = workload.Meta{
 			`survival-goal`:            {RuntimeOnly: true},
 			`replicate-static-columns`: {RuntimeOnly: true},
 			`deprecated-fk-indexes`:    {RuntimeOnly: true},
+			`workload-type`:            {RuntimeOnly: true},
 		}
 
 		g.flags.IntVar(&g.warehouses, `warehouses`, 1, `Number of warehouses for loading`)
@@ -226,6 +230,9 @@ var tpccMeta = workload.Meta{
 		// Hardcode this since it doesn't seem like anyone will want to change
 		// it and it's really noisy in the generated fixture paths.
 		g.nowString = []byte(`2006-01-02 15:04:05`)
+
+		g.flags.StringVar(&g.workloadType, `workload-type`, `mixed`, `Change the workload type among read-only, write-only, and mixed`)
+
 		return g
 	},
 }
@@ -748,7 +755,7 @@ func (w *tpcc) Ops(
 	// Registry.
 	if w.reg == nil {
 		w.reg = reg
-		w.txCounters = setupTPCCMetrics(reg.Registerer())
+		w.txCounters = setupTPCCMetrics(w.workloadType, reg.Registerer())
 	}
 
 	sqlDatabase, err := workload.SanitizeUrls(w, w.dbOverride, urls)

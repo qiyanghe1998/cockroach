@@ -84,6 +84,54 @@ var allTxs = [...]txInfo{
 	},
 }
 
+var readTxs = [...]txInfo{
+	{
+		name:        "newOrderRead",
+		constructor: createNewOrderRead,
+		keyingTime:  18,
+		thinkTime:   12,
+	},
+	{
+		name:        "paymentRead",
+		constructor: createPaymentRead,
+		keyingTime:  3,
+		thinkTime:   12,
+	},
+	{
+		name:        "orderStatusRead",
+		constructor: createOrderStatusRead,
+		keyingTime:  2,
+		thinkTime:   10,
+	},
+	{
+		name:        "deliveryRead",
+		constructor: createDeliveryRead,
+		keyingTime:  2,
+		thinkTime:   5,
+	},
+	{
+		name:        "stockLevelRead",
+		constructor: createStockLevelRead,
+		keyingTime:  2,
+		thinkTime:   5,
+	},
+}
+
+var writeTxs = [...]txInfo{
+	{
+		name:        "newOrderWrite",
+		constructor: createNewOrderWrite,
+		keyingTime:  18,
+		thinkTime:   12,
+	},
+	{
+		name:        "paymentWrite",
+		constructor: createPaymentWrite,
+		keyingTime:  3,
+		thinkTime:   12,
+	},
+}
+
 type txCounter struct {
 	// success and error count the number of successes and failures, respectively,
 	// for the given tx.
@@ -92,10 +140,14 @@ type txCounter struct {
 
 type txCounters map[string]txCounter
 
-func setupTPCCMetrics(reg prometheus.Registerer) txCounters {
+func setupTPCCMetrics(workloadType string, reg prometheus.Registerer) txCounters {
 	m := txCounters{}
 	f := promauto.With(reg)
-	for _, tx := range allTxs {
+	var Txs = append([]txInfo(nil), allTxs[0:]...)
+	Txs = append(Txs, readTxs[0:]...)
+	Txs = append(Txs, writeTxs[0:]...)
+
+	for _, tx := range Txs {
 		m[tx.name] = txCounter{
 			success: f.NewCounter(
 				prometheus.CounterOpts{
@@ -118,7 +170,17 @@ func setupTPCCMetrics(reg prometheus.Registerer) txCounters {
 }
 
 func initializeMix(config *tpcc) error {
-	config.txInfos = append([]txInfo(nil), allTxs[0:]...)
+	switch config.workloadType {
+	case `mixed`:
+		config.txInfos = append([]txInfo(nil), allTxs[0:]...)
+	case `read`:
+		config.txInfos = append([]txInfo(nil), readTxs[0:]...)
+	case `write`:
+		config.txInfos = append([]txInfo(nil), writeTxs[0:]...)
+	default:
+		return errors.Errorf(`Invalid workloadType %s`, config.workloadType)
+	}
+
 	nameToTx := make(map[string]int)
 	for i, tx := range config.txInfos {
 		nameToTx[tx.name] = i

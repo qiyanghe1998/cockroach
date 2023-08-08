@@ -285,15 +285,32 @@ var generators = map[string]builtinDefinition{
 		makeGeneratorOverload(
 			tree.ParamTypes{},
 			types.String,
-			makeWorkloadIndexRecsGeneratorFactory(false /* hasTimestamp */),
+			makeWorkloadIndexRecsGeneratorFactory(false /* hasTimestamp */, false /* hasStatistics */),
 			"Returns set of index recommendations",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
 			tree.ParamTypes{{Name: "timestamptz", Typ: types.TimestampTZ}},
 			types.String,
-			makeWorkloadIndexRecsGeneratorFactory(true /* hasTimestamp */),
+			makeWorkloadIndexRecsGeneratorFactory(true /* hasTimestamp */, false /* hasStatistics */),
 			"Returns set of index recommendations",
+			volatility.Immutable,
+		),
+	),
+
+	"workload_index_recs_with_statistics": makeBuiltin(genProps(),
+		makeGeneratorOverload(
+			tree.ParamTypes{},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(false /* hasTimestamp */, true /* hasStatistics */),
+			"Returns set of index recommendations with their impact encapsulated in json",
+			volatility.Immutable,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{{Name: "timestamptz", Typ: types.TimestampTZ}},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(true /* hasTimestamp */, true /* hasStatistics */),
+			"Returns set of index recommendations with their impact encapsulated in json",
 			volatility.Immutable,
 		),
 	),
@@ -1144,10 +1161,13 @@ func (s *multipleArrayValueGenerator) Values() (tree.Datums, error) {
 	return s.datums, nil
 }
 
-// makeWorkloadIndexRecsGeneratorFactory uses the arrayValueGenerator to return
-// all the index recommendations as an array of strings. The hasTimestamp
+// makeWorkloadIndexRecsGeneratorFactory returns all the index recommendations
+// as an array of strings. When the hasStatistics is true, it will also return a
+// json to show the influence of the index recommendation. The hasTimestamp
 // represents whether there is a timestamp filter.
-func makeWorkloadIndexRecsGeneratorFactory(hasTimestamp bool) eval.GeneratorOverload {
+func makeWorkloadIndexRecsGeneratorFactory(
+	hasTimestamp bool, hasStatistics bool,
+) eval.GeneratorOverload {
 	return func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
 		var ts tree.DTimestampTZ
 		var err error
@@ -1159,19 +1179,85 @@ func makeWorkloadIndexRecsGeneratorFactory(hasTimestamp bool) eval.GeneratorOver
 		}
 
 		var indexRecs []string
-		indexRecs, err = workloadindexrec.FindWorkloadRecs(ctx, evalCtx, &ts)
+		var statistics []json.JSON
+		indexRecs, statistics, err = workloadindexrec.FindWorkloadRecs(ctx, evalCtx, &ts, hasStatistics)
 		if err != nil {
 			return &arrayValueGenerator{}, err
 		}
 
-		arr := tree.NewDArray(types.String)
+		stringArr := tree.NewDArray(types.String)
+		jsonArr := tree.NewDArray(types.Json)
 		for _, indexRec := range indexRecs {
-			if err = arr.Append(tree.NewDString(indexRec)); err != nil {
+			if err = stringArr.Append(tree.NewDString(indexRec)); err != nil {
 				return nil, err
 			}
 		}
-		return &arrayValueGenerator{array: arr}, nil
+
+		for _, data := range statistics {
+			if err = stringArr.Append(tree.NewDJSON(data)); err != nil {
+				return nil, err
+			}
+		}
+
+		if hasStatistics {
+			return &stringAndJsonArrayValueGenerator{stringArr: stringArr, jsonArr: jsonArr, idx: -1}, nil
+		} else {
+			return &arrayValueGenerator{array: stringArr}, nil
+		}
 	}
+}
+
+// statistics4IndexRecsGenerator is a value generator that returns each element of
+// a string array and a json array.
+type stringAndJsonArrayValueGenerator struct {
+	stringArr *tree.DArray
+	jsonArr   *tree.DArray
+	idx       int
+}
+
+var stringAndJsonArrayValueGeneratorType = types.MakeLabeledTuple(
+	[]*types.T{types.String, types.Jsonb},
+	[]string{"index_recommendation", "statistics"},
+)
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (*stringAndJsonArrayValueGenerator) ResolvedType() *types.T {
+	return stringAndJsonArrayValueGeneratorType
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (*stringAndJsonArrayValueGenerator) Close(_ context.Context) {}
+
+// Start implements the tree.ValueGenerator interface.
+func (g *stringAndJsonArrayValueGenerator) Start(_ context.Context, _ *kv.Txn) error {
+	return nil
+}
+
+// Next implements the tree.ValueGenerator interface.
+func (g *stringAndJsonArrayValueGenerator) Next(_ context.Context) (bool, error) {
+	g.idx++
+	if g.idx >= g.stringArr.Len() {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (g *stringAndJsonArrayValueGenerator) Values() (tree.Datums, error) {
+	str := g.stringArr.Array[g.idx]
+	data := g.jsonArr.Array[g.idx]
+
+	if str == tree.DNull || data == tree.DNull {
+		return nil, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"null array element not allowed in this context",
+		)
+	}
+
+	ret := make(tree.Datums, 2)
+	ret[0] = str
+	ret[1] = data
+	return ret, nil
 }
 
 func makeArrayGenerator(

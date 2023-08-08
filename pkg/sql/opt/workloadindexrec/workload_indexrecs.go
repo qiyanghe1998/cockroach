@@ -18,23 +18,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
 )
 
 // FindWorkloadRecs finds index recommendations for the whole workload after the
 // timestamp ts within the space budget represented by budgetBytes.
 func FindWorkloadRecs(
-	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ,
-) ([]string, error) {
+	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ, hasStatistics bool,
+) ([]string, []json.JSON, error) {
 	cis, dis, err := collectIndexRecs(ctx, evalCtx, ts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	trieMap := buildTrieForIndexRecs(cis)
 	newCis, err := extractIndexCovering(trieMap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var res = make([]string, len(newCis))
@@ -60,7 +61,7 @@ func FindWorkloadRecs(
 		res = append(res, dropCmd.String()+";")
 	}
 
-	return res, nil
+	return res, nil, nil
 }
 
 // collectIndexRecs collects all the index recommendations stored in the

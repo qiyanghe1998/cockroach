@@ -27,7 +27,7 @@ import (
 func FindWorkloadRecs(
 	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ, hasStatistics bool,
 ) ([]string, []json.JSON, error) {
-	cis, dis, err := collectIndexRecs(ctx, evalCtx, ts)
+	cis, dis, err := collectIndexRecs(ctx, evalCtx, ts, hasStatistics)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -67,13 +67,18 @@ func FindWorkloadRecs(
 // collectIndexRecs collects all the index recommendations stored in the
 // system.statement_statistics with the time later than ts.
 func collectIndexRecs(
-	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ,
+	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ, hasStatistics bool,
 ) ([]tree.CreateIndex, []tree.DropIndex, error) {
-	query := `SELECT index_recommendations FROM system.statement_statistics
-						 WHERE (statistics -> 'statistics' ->> 'lastExecAt')::TIMESTAMPTZ > $1
+	query := `SELECT index_recommendations{$1} FROM system.statement_statistics
+						 WHERE (statistics -> 'statistics' ->> 'lastExecAt')::TIMESTAMPTZ > $2
 						 AND array_length(index_recommendations, 1) > 0;`
+	statisticsCol := ``
+	if hasStatistics {
+		statisticsCol = `, fingerprint_id, execution_count`
+	}
+
 	indexRecs, err := evalCtx.Planner.QueryIteratorEx(ctx, "get-candidates-for-workload-indexrecs",
-		sessiondata.NoSessionDataOverride, query, ts.Time)
+		sessiondata.NoSessionDataOverride, query, statisticsCol, ts.Time)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -81,6 +86,8 @@ func collectIndexRecs(
 	var p parser.Parser
 	var cis []tree.CreateIndex
 	var dis []tree.DropIndex
+	var fingerprints []string
+	var execution_cnt []int
 	var ok bool
 
 	// The index recommendation starts with "creation", "replacement" or

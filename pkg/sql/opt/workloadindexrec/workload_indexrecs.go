@@ -27,13 +27,13 @@ import (
 func FindWorkloadRecs(
 	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ, hasStatistics bool,
 ) ([]string, []json.JSON, error) {
-	cis, dis, err := collectIndexRecs(ctx, evalCtx, ts, hasStatistics)
+	cis, dis, fingerprints, executionCnts, err := collectIndexRecs(ctx, evalCtx, ts, hasStatistics)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	trieMap := buildTrieForIndexRecs(cis)
-	newCis, err := extractIndexCovering(trieMap)
+	trieMap := buildTrieForIndexRecs(cis, fingerprints, executionCnts)
+	newCis, statistics, err := extractIndexCovering(trieMap, hasStatistics)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -61,14 +61,14 @@ func FindWorkloadRecs(
 		res = append(res, dropCmd.String()+";")
 	}
 
-	return res, nil, nil
+	return res, statistics, nil
 }
 
 // collectIndexRecs collects all the index recommendations stored in the
 // system.statement_statistics with the time later than ts.
 func collectIndexRecs(
 	ctx context.Context, evalCtx *eval.Context, ts *tree.DTimestampTZ, hasStatistics bool,
-) ([]tree.CreateIndex, []tree.DropIndex, error) {
+) ([]tree.CreateIndex, []tree.DropIndex, []string, []int, error) {
 	query := `SELECT index_recommendations{$1} FROM system.statement_statistics
 						 WHERE (statistics -> 'statistics' ->> 'lastExecAt')::TIMESTAMPTZ > $2
 						 AND array_length(index_recommendations, 1) > 0;`
@@ -77,48 +77,48 @@ func collectIndexRecs(
 		statisticsCol = `, fingerprint_id, execution_count`
 	}
 
-	indexRecs, err := evalCtx.Planner.QueryIteratorEx(ctx, "get-candidates-for-workload-indexrecs",
+	results, err := evalCtx.Planner.QueryIteratorEx(ctx, "get-candidates-for-workload-indexrecs",
 		sessiondata.NoSessionDataOverride, query, statisticsCol, ts.Time)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	var p parser.Parser
 	var cis []tree.CreateIndex
 	var dis []tree.DropIndex
 	var fingerprints []string
-	var execution_cnt []int
+	var executionCnts []int
 	var ok bool
 
 	// The index recommendation starts with "creation", "replacement" or
 	// "alteration".
 	var r = regexp.MustCompile(`\s*(creation|replacement|alteration)\s*:\s*(.*)`)
 
-	for ok, err = indexRecs.Next(ctx); ; ok, err = indexRecs.Next(ctx) {
+	for ok, err = results.Next(ctx); ; ok, err = results.Next(ctx) {
 		if err != nil {
-			err = errors.CombineErrors(err, indexRecs.Close())
-			indexRecs = nil
-			return cis, dis, err
+			err = errors.CombineErrors(err, results.Close())
+			results = nil
+			return cis, dis, fingerprints, executionCnts, nil
 		}
 
 		if !ok {
 			break
 		}
 
-		indexes := tree.MustBeDArray(indexRecs.Cur()[0])
+		indexes := tree.MustBeDArray(results.Cur()[0])
 		for _, index := range indexes.Array {
 			indexStr, ok := index.(*tree.DString)
 			if !ok {
-				err = errors.CombineErrors(errors.Newf("%s is not a string!", index.String()), indexRecs.Close())
-				indexRecs = nil
-				return cis, dis, err
+				err = errors.CombineErrors(errors.Newf("%s is not a string!", index.String()), results.Close())
+				results = nil
+				return cis, dis, fingerprints, executionCnts, nil
 			}
 
 			indexStrArr := r.FindStringSubmatch(string(*indexStr))
 			if indexStrArr == nil {
-				err = errors.CombineErrors(errors.Newf("%s is not a valid index recommendation!", string(*indexStr)), indexRecs.Close())
-				indexRecs = nil
-				return cis, dis, err
+				err = errors.CombineErrors(errors.Newf("%s is not a valid index recommendation!", string(*indexStr)), results.Close())
+				results = nil
+				return cis, dis, fingerprints, executionCnts, nil
 			}
 
 			// Since Alter index recommendation only makes invisible indexes visible,
@@ -129,9 +129,9 @@ func collectIndexRecs(
 
 			stmts, err := p.Parse(indexStrArr[2])
 			if err != nil {
-				err = errors.CombineErrors(errors.Newf("%s is not a valid index operation!", indexStrArr[2]), indexRecs.Close())
-				indexRecs = nil
-				return cis, dis, err
+				err = errors.CombineErrors(errors.Newf("%s is not a valid index operation!", indexStrArr[2]), results.Close())
+				results = nil
+				return cis, dis, fingerprints, executionCnts, nil
 			}
 
 			for _, stmt := range stmts {
@@ -146,20 +146,44 @@ func collectIndexRecs(
 				}
 			}
 		}
+
+		if hasStatistics {
+			fingerprint := tree.MustBeDBytes(results.Cur()[1])
+			fingerprints = append(fingerprints, string(fingerprint))
+
+			executionCnt := tree.MustBeDInt(results.Cur()[2])
+			executionCnts = append(executionCnts, int(executionCnt))
+		}
 	}
 
-	return cis, dis, nil
+	return cis, dis, fingerprints, executionCnts, nil
 }
 
 // buildTrieForIndexRecs builds the relation among all the indexRecs by a trie tree.
-func buildTrieForIndexRecs(cis []tree.CreateIndex) map[tree.TableName]*indexTrie {
+func buildTrieForIndexRecs(
+	cis []tree.CreateIndex, fingerprints []string, executionCnts []int,
+) map[tree.TableName]*indexTrie {
 	trieMap := make(map[tree.TableName]*indexTrie)
-	for _, ci := range cis {
+	var fingerprint string
+	var executionCnt int
+	for i, ci := range cis {
 		if _, ok := trieMap[ci.Table]; !ok {
 			trieMap[ci.Table] = NewTrie()
 		}
 
-		trieMap[ci.Table].Insert(ci.Columns, ci.Storing)
+		if i < len(fingerprints) {
+			fingerprint = fingerprints[i]
+		} else {
+			fingerprint = ""
+		}
+
+		if i < len(executionCnts) {
+			executionCnt = executionCnts[i]
+		} else {
+			executionCnt = 0
+		}
+
+		trieMap[ci.Table].Insert(ci.Columns, ci.Storing, fingerprint, executionCnt)
 	}
 	return trieMap
 }
@@ -168,7 +192,9 @@ func buildTrieForIndexRecs(cis []tree.CreateIndex) map[tree.TableName]*indexTrie
 // whether it is covered by some leaf nodes. If yes, discard it; Otherwise,
 // assign it to the shallowest leaf node. Then extractIndexCovering collects all
 // the indexes represented by the leaf node.
-func extractIndexCovering(tm map[tree.TableName]*indexTrie) ([]tree.CreateIndex, error) {
+func extractIndexCovering(
+	tm map[tree.TableName]*indexTrie, hasStatistics bool,
+) ([]tree.CreateIndex, []json.JSON, error) {
 	for _, t := range tm {
 		t.RemoveStorings()
 	}
@@ -176,12 +202,21 @@ func extractIndexCovering(tm map[tree.TableName]*indexTrie) ([]tree.CreateIndex,
 		t.AssignStoring()
 	}
 	var cis []tree.CreateIndex
+	var statistics []json.JSON
 	for table, trie := range tm {
-		indexedColsArray, storingColsArray := collectAllLeavesForTable(trie)
+		indexedColsArray, storingColsArray, fingerprintMaps, executionCnts := collectAllLeavesForTable(trie, hasStatistics)
 		// The length of indexedCols and storingCols must be equal
 		if len(indexedColsArray) != len(storingColsArray) {
-			return nil, errors.Newf("The length of indexedColsArray and storingColsArray after collecting leaves from table %s is not equal!", table)
+			return nil, nil, errors.Newf("The length of indexedColsArray and storingColsArray after collecting leaves from table %s is not equal!", table)
 		}
+
+		if hasStatistics && len(fingerprintMaps) != len(indexedColsArray) {
+			return nil, nil, errors.Newf("The length of indexedColsArray and fingerprintMaps after collecting leaves from table %s is not equal!", table)
+		}
+		if hasStatistics && len(executionCnts) != len(indexedColsArray) {
+			return nil, nil, errors.Newf("The length of indexedColsArray and executionCnts after collecting leaves from table %s is not equal!", table)
+		}
+
 		for i, indexedCols := range indexedColsArray {
 			cisIndexedCols := make([]tree.IndexElem, len(indexedCols))
 			for j, col := range indexedCols {
@@ -199,7 +234,11 @@ func extractIndexCovering(tm map[tree.TableName]*indexTrie) ([]tree.CreateIndex,
 				Columns: cisIndexedCols,
 				Storing: storingColsArray[i],
 			})
+
+			if hasStatistics {
+
+			}
 		}
 	}
-	return cis, nil
+	return cis, nil, nil
 }

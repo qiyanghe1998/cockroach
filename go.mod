@@ -171,6 +171,7 @@ require (
 	github.com/kr/pretty v0.3.1
 	github.com/kr/text v0.2.0
 	github.com/kylelemons/godebug v1.1.0
+	github.com/labstack/gommon v0.3.1
 	github.com/leanovate/gopter v0.2.5-0.20190402064358-634a59d12406
 	github.com/lestrrat-go/jwx v1.2.25
 	github.com/lib/pq v1.10.7

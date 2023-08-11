@@ -27,10 +27,12 @@ type indexedColumn struct {
 // TrieNode stores the indexed columns, storing columns, parent node and the
 // indexed column represented by the node (used to assign storings).
 type indexTrieNode struct {
-	children map[indexedColumn]*indexTrieNode
-	storing  map[string]struct{}
-	parent   *indexTrieNode
-	col      indexedColumn
+	children     map[indexedColumn]*indexTrieNode
+	storing      map[string]struct{}
+	parent       *indexTrieNode
+	col          indexedColumn
+	executionCnt int
+	fingerprints map[string]struct{}
 }
 
 // indexTrie is an implementation of a indexTrie-tree specific for indexes of
@@ -51,7 +53,9 @@ func NewTrie() *indexTrie {
 }
 
 // Insert parses the columns in ci (CreateIndex) and updates the trie.
-func (trie *indexTrie) Insert(indexedCols tree.IndexElemList, storingCols tree.NameList) {
+func (trie *indexTrie) Insert(
+	indexedCols tree.IndexElemList, storingCols tree.NameList, fingerprint string, executionCnt int,
+) {
 	node := trie.root
 	for _, indexedCol := range indexedCols {
 		indexCol := indexedColumn{
@@ -86,6 +90,17 @@ func (trie *indexTrie) Insert(indexedCols tree.IndexElemList, storingCols tree.N
 		for _, storingCol := range storingCols {
 			node.storing[string(storingCol)] = struct{}{}
 		}
+	}
+
+	if len(fingerprint) > 0 {
+		if node.fingerprints == nil {
+			node.fingerprints = make(map[string]struct{})
+		}
+		node.fingerprints[fingerprint] = struct{}{}
+	}
+
+	if executionCnt > 0 {
+		node.executionCnt += executionCnt
 	}
 }
 
@@ -222,11 +237,15 @@ func (node *indexTrieNode) assignStoringToShallowestLeaf(curDep int) (*indexTrie
 
 // collectAllLeavesForTables collects all the indexes represented by the leaf
 // nodes of trie.
-func collectAllLeavesForTable(trie *indexTrie) ([][]indexedColumn, [][]tree.Name) {
+func collectAllLeavesForTable(
+	trie *indexTrie, hasStatistics bool,
+) ([][]indexedColumn, [][]tree.Name, []map[string]struct{}, []int) {
 	var indexedColsArray [][]indexedColumn
 	var storingColsArray [][]tree.Name
-	collectAllLeaves(trie.root, &indexedColsArray, &storingColsArray, []indexedColumn{})
-	return indexedColsArray, storingColsArray
+	var fingerprintMaps []map[string]struct{}
+	var executionCnts []int
+	collectAllLeaves(trie.root, &indexedColsArray, &storingColsArray, &fingerprintMaps, &executionCnts, []indexedColumn{}, make(map[string]struct{}), 0)
+	return indexedColsArray, storingColsArray, fingerprintMaps, executionCnts
 }
 
 // collectAllLeaves collects all the indexes represented by the leaf nodes
@@ -235,7 +254,11 @@ func collectAllLeaves(
 	node *indexTrieNode,
 	indexedCols *[][]indexedColumn,
 	storingCols *[][]tree.Name,
+	fingerprintMaps *[]map[string]struct{},
+	executionCnts *[]int,
 	curIndexedCols []indexedColumn,
+	curFingerprintMap map[string]struct{},
+	curExecutionCnt int,
 ) {
 	if len(node.children) == 0 {
 		curStoringCols := make([]tree.Name, len(node.storing))
@@ -246,10 +269,24 @@ func collectAllLeaves(
 		}
 		*indexedCols = append(*indexedCols, curIndexedCols)
 		*storingCols = append(*storingCols, curStoringCols)
+		*fingerprintMaps = append(*fingerprintMaps, curFingerprintMap)
+		*executionCnts = append(*executionCnts, curExecutionCnt)
 		return
 	}
 
 	for indexCol, child := range node.children {
-		collectAllLeaves(child, indexedCols, storingCols, append(curIndexedCols, indexCol))
+		collectAllLeaves(child, indexedCols, storingCols, fingerprintMaps, executionCnts, append(curIndexedCols, indexCol),
+			stringMapUnion(curFingerprintMap, child.fingerprints), curExecutionCnt+child.executionCnt)
 	}
+}
+
+func stringMapUnion(map1, map2 map[string]struct{}) map[string]struct{} {
+	results := make(map[string]struct{})
+	for k := range map1 {
+		results[k] = struct{}{}
+	}
+	for k := range map2 {
+		results[k] = struct{}{}
+	}
+	return results
 }
